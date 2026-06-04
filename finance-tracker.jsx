@@ -1108,13 +1108,13 @@ function AnalysisTab({ transactions, payslips }) {
       {monthlyData.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
           <h3 className="text-lg font-semibold text-gray-900 mb-4">Monthly Income vs Expenditure</h3>
-          <ResponsiveContainer width="100%" height={350}>
-            <BarChart data={monthlyData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-              <XAxis dataKey="label" tick={{ fontSize: 12 }} />
-              <YAxis tickFormatter={v => `£${(v / 1000).toFixed(0)}k`} tick={{ fontSize: 12 }} />
-              <Tooltip formatter={(v) => formatCurrency(v)} />
-              <Legend />
+          <ResponsiveContainer width="100%" height={320}>
+            <BarChart data={monthlyData} barCategoryGap="30%">
+              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
+              <XAxis dataKey="label" tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
+              <YAxis tickFormatter={v => `£${(v / 1000).toFixed(0)}k`} tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
+              <Tooltip formatter={(v) => formatCurrency(v)} contentStyle={{ fontSize: 13, borderRadius: 8 }} />
+              <Legend wrapperStyle={{ fontSize: 13, paddingTop: 8 }} />
               <Bar dataKey="income" name="Income" fill="#10b981" radius={[4, 4, 0, 0]} />
               <Bar dataKey="expenditure" name="Expenditure" fill="#f43f5e" radius={[4, 4, 0, 0]} />
             </BarChart>
@@ -1139,35 +1139,76 @@ function AnalysisTab({ transactions, payslips }) {
       )}
 
       {/* Spending by Category */}
-      {categoryData.length > 0 && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-4">Spending by Category</h3>
-            <ResponsiveContainer width="100%" height={300}>
-              <PieChart>
-                <Pie data={categoryData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={100} label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`} labelLine={false}>
-                  {categoryData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                </Pie>
-                <Tooltip formatter={v => formatCurrency(v)} />
-              </PieChart>
-            </ResponsiveContainer>
-          </div>
-          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-4">Category Breakdown</h3>
-            <div className="space-y-2 max-h-72 overflow-y-auto">
-              {categoryData.map((cat, i) => (
-                <div key={cat.name} className="flex items-center justify-between py-1.5">
-                  <div className="flex items-center gap-2">
-                    <div className="w-3 h-3 rounded-full" style={{ backgroundColor: COLORS[i % COLORS.length] }} />
-                    <span className="text-sm text-gray-700">{cat.name}</span>
+      {categoryData.length > 0 && (() => {
+        const totalSpend = categoryData.reduce((s, c) => s + c.value, 0);
+        const mainCats = categoryData.filter(c => c.value / totalSpend >= 0.03);
+        const smallCats = categoryData.filter(c => c.value / totalSpend < 0.03);
+        const pieData = smallCats.length > 0
+          ? [...mainCats, { name: `Other (${smallCats.length})`, value: smallCats.reduce((s, c) => s + c.value, 0) }]
+          : mainCats;
+        const maxVal = categoryData[0]?.value || 1;
+        return (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-1">Spending by Category</h3>
+              {smallCats.length > 0 && (
+                <p className="text-xs text-gray-400 mb-3">{smallCats.length} small categories grouped into Other</p>
+              )}
+              <div className="relative">
+                <ResponsiveContainer width="100%" height={300}>
+                  <PieChart>
+                    <Pie
+                      data={pieData}
+                      dataKey="value"
+                      nameKey="name"
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={75}
+                      outerRadius={118}
+                      paddingAngle={2}
+                    >
+                      {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                    </Pie>
+                    <Tooltip
+                      formatter={(v, name) => [formatCurrency(v), name]}
+                      contentStyle={{ fontSize: 13, borderRadius: 8, border: "1px solid #e5e7eb" }}
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="text-center">
+                    <p className="text-xs text-gray-400 mb-0.5">Total Spend</p>
+                    <p className="text-lg font-bold text-gray-900">{formatCurrency(totalSpend)}</p>
                   </div>
-                  <span className="text-sm font-medium text-gray-900">{formatCurrency(cat.value)}</span>
                 </div>
-              ))}
+              </div>
+            </div>
+            <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-4">Category Breakdown</h3>
+              <div className="space-y-3 max-h-[300px] overflow-y-auto pr-1">
+                {categoryData.map((cat, i) => {
+                  const pct = totalSpend > 0 ? (cat.value / totalSpend) * 100 : 0;
+                  const barWidth = (cat.value / maxVal) * 100;
+                  const color = COLORS[i % COLORS.length];
+                  return (
+                    <div key={cat.name}>
+                      <div className="flex items-center gap-2 mb-1">
+                        <div className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: color }} />
+                        <span className="text-sm text-gray-700 flex-1 truncate">{cat.name}</span>
+                        <span className="text-xs text-gray-400 tabular-nums">{pct.toFixed(1)}%</span>
+                        <span className="text-sm font-semibold text-gray-900 tabular-nums w-24 text-right">{formatCurrency(cat.value)}</span>
+                      </div>
+                      <div className="ml-4 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                        <div className="h-full rounded-full transition-all" style={{ width: `${barWidth}%`, backgroundColor: color }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Payslip Summary */}
       {payslipTotals && (
