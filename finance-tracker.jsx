@@ -19,7 +19,7 @@ const STORAGE_BUCKET = "csv-uploads";
 // SUPABASE HELPERS
 // ─────────────────────────────────────────────
 
-async function saveTransactionsToDB(userId, transactions, sourceFile, bankFormat) {
+async function saveTransactionsToDB(userId, transactions, sourceFile, bankFormat, bankName, accountType) {
   const rows = transactions.map(t => ({
     user_id: userId,
     date: t.date?.toISOString().split("T")[0],
@@ -31,6 +31,8 @@ async function saveTransactionsToDB(userId, transactions, sourceFile, bankFormat
     balance: t.balance || null,
     source_file: sourceFile || null,
     bank_format: bankFormat || null,
+    bank_name: bankName || null,
+    account_type: accountType || null,
   }));
   // Insert in batches of 500
   for (let i = 0; i < rows.length; i += 500) {
@@ -114,7 +116,7 @@ async function uploadCSVToStorage(userId, file) {
   return path;
 }
 
-async function trackCSVUpload(userId, fileName, filePath, fileType, bankFormat, rowCount) {
+async function trackCSVUpload(userId, fileName, filePath, fileType, bankFormat, rowCount, contentHash, bankName, accountType) {
   const { error } = await supabase.from("csv_uploads").insert({
     user_id: userId,
     file_name: fileName,
@@ -122,7 +124,40 @@ async function trackCSVUpload(userId, fileName, filePath, fileType, bankFormat, 
     file_type: fileType,
     bank_format: bankFormat || null,
     row_count: rowCount,
+    content_hash: contentHash || null,
+    bank_name: bankName || null,
+    account_type: accountType || null,
   });
+  if (error) throw error;
+}
+
+async function hashFileContent(text) {
+  const buffer = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function findDuplicateUpload(userId, contentHash) {
+  const { data } = await supabase
+    .from("csv_uploads")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("content_hash", contentHash)
+    .maybeSingle();
+  return data;
+}
+
+async function deleteTransactionsBySource(userId, sourceFile) {
+  const { error } = await supabase
+    .from("transactions")
+    .delete()
+    .eq("user_id", userId)
+    .eq("source_file", sourceFile);
+  if (error) throw error;
+}
+
+async function deleteUploadRecord(uploadId) {
+  const { error } = await supabase.from("csv_uploads").delete().eq("id", uploadId);
   if (error) throw error;
 }
 
@@ -130,6 +165,16 @@ async function loadProfile(userId) {
   const { data, error } = await supabase.from("profiles").select("*").eq("id", userId).single();
   if (error) throw error;
   return data;
+}
+
+async function loadCSVUploads(userId) {
+  const { data, error } = await supabase
+    .from("csv_uploads")
+    .select("*")
+    .eq("user_id", userId)
+    .order("uploaded_at", { ascending: false });
+  if (error) throw error;
+  return data || [];
 }
 
 async function updateProfile(userId, updates) {
@@ -143,39 +188,226 @@ async function updateProfile(userId, updates) {
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
-// Keywords use word-boundary-aware matching to avoid false positives
-// (e.g. "pay" must not match "payment", "isa" must not match "visa")
+// Ordered merchant → category lookup. More specific entries first.
+// Checked before CATEGORY_KEYWORDS so exact merchant names win.
+const MERCHANT_MAP = [
+  // Dining Out — restaurants, cafes, fast food, delivery
+  ["pret a manger","Dining Out"],["pret ","Dining Out"],
+  ["hawksmoor","Dining Out"],["wagamama","Dining Out"],
+  ["pizza express","Dining Out"],["pizza hut","Dining Out"],
+  ["domino","Dining Out"],["five guys","Dining Out"],["greggs","Dining Out"],
+  ["leon ","Dining Out"],["itsu","Dining Out"],["wasabi","Dining Out"],
+  ["yo sushi","Dining Out"],["yo! sushi","Dining Out"],
+  ["bills ","Dining Out"],["carluccios","Dining Out"],
+  ["zizzi","Dining Out"],["ask italian","Dining Out"],
+  ["harvester","Dining Out"],["wetherspoon","Dining Out"],
+  ["caffe nero","Dining Out"],["patisserie","Dining Out"],
+  ["dishoom","Dining Out"],["flat iron","Dining Out"],
+  ["ottolenghi","Dining Out"],["cote brasserie","Dining Out"],
+  ["shake shack","Dining Out"],["burger king","Dining Out"],
+  ["byron burger","Dining Out"],["honest burger","Dining Out"],
+  ["gourmet burger","Dining Out"],["patty and bun","Dining Out"],
+  ["chilango","Dining Out"],["tortilla","Dining Out"],["chipotle","Dining Out"],
+  ["the ivy","Dining Out"],["nobu ","Dining Out"],["gaucho","Dining Out"],
+  ["sketch ","Dining Out"],["hakkasan","Dining Out"],
+  ["sexy fish","Dining Out"],["duck & waffle","Dining Out"],
+  ["sushisamba","Dining Out"],["oblix","Dining Out"],
+  ["cafe rouge","Dining Out"],["bella italia","Dining Out"],
+  ["prezzo","Dining Out"],["frankie & benny","Dining Out"],
+  ["tgi friday","Dining Out"],["chiquito","Dining Out"],
+  ["toby carvery","Dining Out"],["hungry horse","Dining Out"],
+  ["turtle bay","Dining Out"],["wahaca","Dining Out"],
+  ["the real greek","Dining Out"],["mildreds","Dining Out"],
+  ["hoppers","Dining Out"],["bleecker","Dining Out"],
+  ["chicken shop","Dining Out"],["pizza pilgrims","Dining Out"],
+  ["franco manca","Dining Out"],["smokehouse","Dining Out"],
+  ["smoky boys","Dining Out"],["roti king","Dining Out"],
+  ["gails","Dining Out"],["gail's","Dining Out"],
+  ["paul bakery","Dining Out"],["le pain quotidien","Dining Out"],
+  ["brasserie","Dining Out"],["ristorante","Dining Out"],
+  ["deliveroo","Dining Out"],["just eat","Dining Out"],["uber eats","Dining Out"],
+
+  // Subscriptions — streaming, software, SaaS, security
+  ["ring multi","Subscriptions"],["ring.com","Subscriptions"],
+  ["amazon prime","Subscriptions"],["prime video","Subscriptions"],
+  ["apple tv+","Subscriptions"],["apple one","Subscriptions"],
+  ["icloud","Subscriptions"],["microsoft 365","Subscriptions"],
+  ["office 365","Subscriptions"],["adobe ","Subscriptions"],
+  ["youtube premium","Subscriptions"],["now tv","Subscriptions"],
+  ["bt sport","Subscriptions"],["dazn","Subscriptions"],
+  ["paramount+","Subscriptions"],["paramount plus","Subscriptions"],
+  ["apple music","Subscriptions"],["tidal ","Subscriptions"],
+  ["audible","Subscriptions"],["kindle unlimited","Subscriptions"],
+  ["duolingo","Subscriptions"],["headspace","Subscriptions"],
+  ["calm app","Subscriptions"],["peloton","Subscriptions"],
+  ["zwift","Subscriptions"],["strava","Subscriptions"],
+  ["norton ","Subscriptions"],["mcafee","Subscriptions"],
+  ["kaspersky","Subscriptions"],["dropbox","Subscriptions"],
+  ["lastpass","Subscriptions"],["1password","Subscriptions"],
+  ["canva ","Subscriptions"],["openai","Subscriptions"],
+  ["chatgpt","Subscriptions"],["anthropic","Subscriptions"],
+  ["patreon","Subscriptions"],["substack","Subscriptions"],
+  ["britbox","Subscriptions"],["hayu ","Subscriptions"],
+  ["crunchyroll","Subscriptions"],["mubi","Subscriptions"],
+  ["discovery+","Subscriptions"],["acorn tv","Subscriptions"],
+  ["playstation plus","Subscriptions"],["playstation now","Subscriptions"],
+  ["xbox game pass","Subscriptions"],["nintendo online","Subscriptions"],
+  ["discord nitro","Subscriptions"],["twitch sub","Subscriptions"],
+  ["sky cinema","Subscriptions"],["sky sports","Subscriptions"],
+  ["membership","Subscriptions"],["subscription","Subscriptions"],
+
+  // Entertainment — venues, clubs, cinema, events, activities
+  ["manor london","Entertainment"],["fabric ","Entertainment"],
+  ["egg london","Entertainment"],["printworks","Entertainment"],
+  ["oval space","Entertainment"],["village underground","Entertainment"],
+  ["roundhouse","Entertainment"],["barbican","Entertainment"],
+  ["royal albert hall","Entertainment"],["o2 arena","Entertainment"],
+  ["wembley","Entertainment"],["odeon ","Entertainment"],
+  ["vue cinema","Entertainment"],["cineworld","Entertainment"],
+  ["picturehouse","Entertainment"],["curzon ","Entertainment"],
+  ["ticketmaster","Entertainment"],["eventbrite","Entertainment"],
+  ["see tickets","Entertainment"],["stubhub","Entertainment"],
+  ["viagogo","Entertainment"],["dice.fm","Entertainment"],
+  ["comedy store","Entertainment"],["comedy club","Entertainment"],
+  ["go ape","Entertainment"],["legoland","Entertainment"],
+  ["thorpe park","Entertainment"],["alton towers","Entertainment"],
+  ["chessington","Entertainment"],["kew garden","Entertainment"],
+  ["national gallery","Entertainment"],["tate modern","Entertainment"],
+  ["theatre","Entertainment"],["theater","Entertainment"],
+  ["bowling","Entertainment"],["laser quest","Entertainment"],
+  ["escape room","Entertainment"],["mini golf","Entertainment"],
+  ["crazy golf","Entertainment"],["karting","Entertainment"],
+  ["paintball","Entertainment"],["trampoline park","Entertainment"],
+  ["cinema","Entertainment"],["imax","Entertainment"],
+  ["nightclub","Entertainment"],["night club","Entertainment"],
+
+  // Shopping — clothing, homeware, electronics, beauty
+  ["ikea","Shopping"],["dunelm","Shopping"],["b&q","Shopping"],
+  ["screwfix","Shopping"],["toolstation","Shopping"],
+  ["sports direct","Shopping"],["jd sports","Shopping"],
+  ["foot locker","Shopping"],["schuh","Shopping"],["clarks ","Shopping"],
+  ["selfridges","Shopping"],["harrods","Shopping"],["liberty ","Shopping"],
+  ["harvey nichols","Shopping"],["the range","Shopping"],
+  ["home bargains","Shopping"],["wilko","Shopping"],["poundland","Shopping"],
+  ["waterstones","Shopping"],["pets at home","Shopping"],
+  ["oliver bonas","Shopping"],["the white company","Shopping"],
+  ["fat face","Shopping"],["ted baker","Shopping"],
+  ["hugo boss","Shopping"],["uniqlo","Shopping"],
+  ["reiss ","Shopping"],["whistles","Shopping"],["jigsaw ","Shopping"],
+  ["lk bennett","Shopping"],["lk.bennett","Shopping"],
+  ["matalan","Shopping"],["superdry","Shopping"],
+  ["jack wills","Shopping"],["river island","Shopping"],
+  ["apple.com","Shopping"],["apple store","Shopping"],
+  ["microsoft store","Shopping"],["samsung","Shopping"],
+  ["currys","Shopping"],["argos","Shopping"],["ao.com","Shopping"],
+  ["very.co.uk","Shopping"],["studio ","Shopping"],
+
+  // Health & Fitness
+  ["pure gym","Health"],["anytime fitness","Health"],
+  ["david lloyd","Health"],["virgin active","Health"],
+  ["fitness first","Health"],["the gym group","Health"],
+  ["nuffield health","Health"],["lloyds pharmacy","Health"],
+  ["superdrug","Health"],["holland & barrett","Health"],
+  ["holland and barrett","Health"],["vision express","Health"],
+  ["specsavers","Health"],["boots optician","Health"],
+
+  // Transport
+  ["trainline","Transport"],["national rail","Transport"],
+  ["greater anglia","Transport"],["thameslink","Transport"],
+  ["avanti west","Transport"],["great western railway","Transport"],
+  ["southeastern","Transport"],["gwr","Transport"],
+  ["chiltern rail","Transport"],["scotrail","Transport"],
+  ["stagecoach bus","Transport"],["national express","Transport"],
+  ["megabus","Transport"],["heathrow express","Transport"],
+  ["gatwick express","Transport"],["stansted express","Transport"],
+  ["santander cycles","Transport"],["zipcar","Transport"],
+  ["enterprise rent","Transport"],["europcar","Transport"],
+  ["hertz","Transport"],["addison lee","Transport"],
+  ["lime ebike","Transport"],["voi ","Transport"],
+
+  // Utilities — energy, water, telecoms
+  ["octopus energy","Utilities"],["british gas","Utilities"],
+  ["eon energy","Utilities"],["eon ","Utilities"],
+  ["edf energy","Utilities"],["edf ","Utilities"],
+  ["npower","Utilities"],["scottish power","Utilities"],
+  ["thames water","Utilities"],["severn trent","Utilities"],
+  ["anglian water","Utilities"],["talktalk","Utilities"],
+  ["plusnet","Utilities"],["shell energy","Utilities"],
+  ["bulb energy","Utilities"],["ovo energy","Utilities"],
+  ["so energy","Utilities"],["e.on","Utilities"],
+
+  // Housing
+  ["foxtons","Housing"],["savills","Housing"],
+  ["purplebricks","Housing"],["rightmove","Housing"],
+  ["openrent","Housing"],["zoopla","Housing"],
+  ["ground rent","Housing"],["service charge","Housing"],
+  ["letting agent","Housing"],
+];
+
 const CATEGORY_KEYWORDS = {
-  "Housing": { words: ["rent","mortgage","council tax","estate agent","letting"], exact: false },
-  "Utilities": { words: ["electric","gas","water","broadband","internet","phone","mobile","bt ","virgin media","sky ","ee ","vodafone","o2 ","three mobile"], exact: false },
-  "Groceries": { words: ["tesco","sainsbury","asda","aldi","lidl","morrisons","waitrose","co-op","ocado","iceland","marks&spencer","marks & spencer","m&s "], exact: false },
-  "Transport": { words: ["tfl ","tfl.gov","uber","train","rail","bus ","petrol","fuel","shell ","bp ","esso","parking","dvla","mot ","travel ch"], exact: false },
-  "Dining Out": { words: ["restaurant","cafe","coffee","starbucks","costa","mcdonald","kfc","nando","deliveroo","just eat","uber eats"], exact: false },
-  "Shopping": { words: ["amazon","ebay","argos","john lewis","currys","next ","primark","asos","zara","h&m","westfield","shopping","eden centre","hampton court"], exact: false },
-  "Subscriptions": { words: ["netflix","spotify","disney plus","disney+","apple.com/bill","apple com bill","gym","membership","subscription"], exact: false },
-  "Insurance": { words: ["insurance","aviva","direct line","admiral","axa"], exact: false },
-  "Childcare": { words: ["nursery","childcare","childminder","after school"], exact: false },
-  "Health": { words: ["pharmacy","dentist","optician","doctor","nhs","boots "], exact: false },
-  "Investments": { words: ["tesla inc","trading 212","freetrade","hargreaves","vanguard","nutmeg","etoro","invest"], exact: false },
-  "Savings": { words: [" isa ","cash isa","stocks isa","savings"], exact: false },
-  "Income": { words: ["salary","wages","dividend","refund","hmrc","tax credit","child benefit","universal credit","bacs credit"], exact: false },
+  "Housing":       { words: ["rent","mortgage","council tax","estate agent","letting","ground rent","service charge"] },
+  "Utilities":     { words: ["electric","gas ","water","broadband","internet","phone","mobile","bt ","virgin media","sky ","ee ","vodafone","o2 ","three mobile","utility"] },
+  "Groceries":     { words: ["tesco","sainsbury","asda","aldi","lidl","morrisons","waitrose","co-op","ocado","iceland","marks&spencer","marks & spencer","m&s food","whole foods","planet organic","spar ","londis","budgens","nisa ","farm foods"] },
+  "Transport":     { words: ["tfl ","tfl.gov","uber ","train","rail","bus ","petrol","fuel","shell ","bp ","esso","parking","dvla","mot ","travel ch","oyster","taxi","cab "] },
+  "Dining Out":    { words: ["restaurant","cafe ","caffe","coffee","starbucks","costa","mcdonald","kfc","nando","pub ","bar ","inn ","arms ","tavern ","kitchen ","sushi","burger","grill ","tapas"] },
+  "Shopping":      { words: ["amazon","ebay","john lewis","next ","primark","asos","zara","h&m","westfield","shopping","eden centre","hampton court"] },
+  "Subscriptions": { words: ["netflix","spotify","disney plus","disney+","apple.com/bill","apple com bill","gym","annual fee"] },
+  "Insurance":     { words: ["insurance","aviva","direct line","admiral","axa","zurich","legal & general","prudential","standard life","vitality","bupa ","denplan","simplyhealth","petplan","hastings","lv "] },
+  "Childcare":     { words: ["nursery","childcare","childminder","after school","breakfast club","holiday club"] },
+  "Health":        { words: ["pharmacy","dentist","optician","doctor","nhs","boots ","vitamin","supplement","physio","therapist"] },
+  "Entertainment": { words: ["concert","tickets","casino ","arcade","museum ","gallery ","exhibition","bowling","golf "] },
+  "Investments":   { words: ["tesla inc","trading 212","freetrade","hargreaves","vanguard","nutmeg","etoro","invest","moneybox","wealthify"] },
+  "Savings":       { words: [" isa ","cash isa","stocks isa","savings","marcus ","atom bank"] },
+  "Income":        { words: ["salary","wages","dividend","refund","hmrc","tax credit","child benefit","universal credit","bacs credit","cashback","interest paid"] },
 };
 
 function categoriseTransaction(description, type) {
-  const lowerType = (" " + (type || "").toLowerCase() + " ");
-  const lower = (" " + (description || "").toLowerCase() + " ");
-  const combined = lowerType + " " + lower;
-  // Use the type field for broad classification
+  const lowerType = (type || "").toLowerCase();
+  const lower = (description || "").toLowerCase();
+  const combined = " " + lowerType + " " + lower + " ";
+
+  // Type-based broad classification (highest priority)
   if (/transfer|tfr/i.test(type)) return "Transfer";
   if (/standing order/i.test(type)) return "Standing Order";
   if (/direct debit|dd /i.test(type)) return "Direct Debit";
   if (/interest/i.test(type)) return "Interest";
   if (/atm|cash/i.test(type)) return "Cash";
-  // Then match description + type against category keywords
+
+  // Specific merchant lookup (checked before general keywords)
+  for (const [merchant, category] of MERCHANT_MAP) {
+    if (combined.includes(merchant)) return category;
+  }
+
+  // General keyword categories
   for (const [category, { words }] of Object.entries(CATEGORY_KEYWORDS)) {
     if (words.some(kw => combined.includes(kw))) return category;
   }
+
   return "Other";
+}
+
+// Re-categorise all transactions using current rules and persist changes to Supabase
+async function recategoriseAllTransactions(userId, transactions, setTransactions) {
+  const recategorised = transactions.map(t => ({
+    ...t,
+    category: categoriseTransaction(t.description || "", t.type || ""),
+  }));
+
+  const changed = recategorised.filter((t, i) => t.category !== transactions[i].category);
+  if (changed.length === 0) return 0;
+
+  // Group changed transactions by their new category for batch Supabase updates
+  const byCategory = {};
+  for (const t of changed) {
+    if (!byCategory[t.category]) byCategory[t.category] = [];
+    byCategory[t.category].push(t.id);
+  }
+  for (const [category, ids] of Object.entries(byCategory)) {
+    await supabase.from("transactions").update({ category }).in("id", ids);
+  }
+
+  setTransactions(recategorised);
+  return changed.length;
 }
 
 function parseAmount(val) {
@@ -592,6 +824,17 @@ const HMRC_SCHEMES = [
 ];
 
 // ─────────────────────────────────────────────
+// UK BANKS
+// ─────────────────────────────────────────────
+
+const UK_BANKS = [
+  "Barclays","HSBC","Lloyds","NatWest","Santander","Halifax","Nationwide",
+  "Monzo","Starling Bank","First Direct","Metro Bank","TSB",
+  "Co-operative Bank","RBS","Bank of Scotland","Chase UK","Revolut","Tide",
+  "American Express","Capital One","Virgin Money",
+];
+
+// ─────────────────────────────────────────────
 // COLOUR PALETTE
 // ─────────────────────────────────────────────
 
@@ -604,46 +847,71 @@ const COLORS = ["#6366f1","#f43f5e","#10b981","#f59e0b","#3b82f6","#8b5cf6","#ec
 // === TRANSACTIONS IMPORT TAB ===
 function TransactionsTab({ transactions, setTransactions, userId }) {
   const [saving, setSaving] = useState(false);
-  const [detectedBank, setDetectedBank] = useState(null);
-  const [importCount, setImportCount] = useState(0);
+  const [importSuccess, setImportSuccess] = useState(null);
   const [error, setError] = useState(null);
+  const [pendingImport, setPendingImport] = useState(null);
+  const [importMeta, setImportMeta] = useState({ bankName: "", customBank: "", accountType: "debit" });
   const [page, setPage] = useState(0);
   const pageSize = 50;
   const fileRef = useRef(null);
 
+  const doImport = useCallback(async (file, hash, tagged, format, bankName, accountType) => {
+    const storagePath = await uploadCSVToStorage(userId, file);
+    await saveTransactionsToDB(userId, tagged, file.name, format.name, bankName, accountType);
+    await trackCSVUpload(userId, file.name, storagePath, "midata", format.name, tagged.length, hash, bankName, accountType);
+    setTransactions(prev => [...prev, ...tagged]);
+    setImportSuccess({ count: tagged.length, bankName, accountType });
+  }, [userId, setTransactions]);
+
   const handleFile = useCallback(async (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    setError(null); setSaving(true);
+    setError(null); setPendingImport(null); setImportSuccess(null); setSaving(true);
     try {
       const text = await file.text();
       const { headers, data } = parseCSV(text);
       if (data.length === 0) { setError("No data rows found in file."); setSaving(false); return; }
       const { key, format } = detectBankFormat(headers);
-      setDetectedBank(format.name);
+      if (key !== "midata") {
+        setError("Only midata CSV files are accepted. Export your transactions from your bank using the midata standard and try again.");
+        setSaving(false);
+        return;
+      }
+      const hash = await hashFileContent(text);
       const mapped = data.map(row => {
         const t = format.map(row);
         return { ...t, category: categoriseTransaction(t.description, t.type) };
       }).filter(t => t.date);
-      setImportCount(mapped.length);
+      const existing = await findDuplicateUpload(userId, hash);
+      setPendingImport({ file, hash, mapped, format, existing: existing || null });
+    } catch (err) {
+      setError("Failed to read file: " + err.message);
+    }
+    setSaving(false);
+    e.target.value = "";
+  }, [userId]);
 
-      // Upload CSV to Supabase Storage
-      const storagePath = await uploadCSVToStorage(userId, file);
-
-      // Save transactions to database
-      await saveTransactionsToDB(userId, mapped, file.name, format.name);
-
-      // Track the upload
-      await trackCSVUpload(userId, file.name, storagePath, key === "midata" ? "midata" : "bank_csv", format.name, mapped.length);
-
-      // Update local state
-      setTransactions(prev => [...prev, ...mapped]);
+  const handleConfirmImport = useCallback(async () => {
+    if (!pendingImport) return;
+    const bankName = importMeta.bankName === "other" ? importMeta.customBank.trim() : importMeta.bankName;
+    if (!bankName) { setError("Please select or enter a bank name."); return; }
+    setSaving(true); setError(null);
+    try {
+      const { file, hash, mapped, format, existing } = pendingImport;
+      const tagged = mapped.map(t => ({ ...t, bank_name: bankName, account_type: importMeta.accountType }));
+      if (existing) {
+        await deleteTransactionsBySource(userId, existing.file_name);
+        await deleteUploadRecord(existing.id);
+        setTransactions(prev => prev.filter(t => t.source_file !== existing.file_name));
+      }
+      await doImport(file, hash, tagged, format, bankName, importMeta.accountType);
+      setPendingImport(null);
+      setImportMeta({ bankName: "", customBank: "", accountType: "debit" });
     } catch (err) {
       setError("Failed to import: " + err.message);
     }
     setSaving(false);
-    e.target.value = "";
-  }, [setTransactions, userId]);
+  }, [pendingImport, importMeta, userId, doImport, setTransactions]);
 
   const clearAll = async () => {
     try {
@@ -660,15 +928,15 @@ function TransactionsTab({ transactions, setTransactions, userId }) {
     <div className="space-y-6">
       <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
         <h2 className="text-lg font-semibold text-gray-900 mb-1">Import Bank Transactions</h2>
-        <p className="text-sm text-gray-500 mb-4">Upload midata or bank CSV exports. Supports Barclays, HSBC, Lloyds, NatWest, Nationwide, and generic CSV.</p>
+        <p className="text-sm text-gray-500 mb-4">Upload your midata CSV export. In your bank's app or website, go to <strong>Export transactions → midata format</strong> and upload the file here.</p>
 
         <div
           onClick={() => fileRef.current?.click()}
           className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-indigo-400 hover:bg-indigo-50 transition-colors"
         >
           <Upload className="mx-auto mb-3 text-gray-400" size={36} />
-          <p className="text-sm font-medium text-gray-700">{saving ? "Uploading and saving..." : "Click to upload CSV file"}</p>
-          <p className="text-xs text-gray-400 mt-1">Midata, Barclays, HSBC, Lloyds, NatWest, Nationwide, or any CSV with date/description/amount columns</p>
+          <p className="text-sm font-medium text-gray-700">{saving ? "Uploading and saving..." : "Click to upload midata CSV"}</p>
+          <p className="text-xs text-gray-400 mt-1">Midata format only — other CSV formats will be rejected</p>
           <input ref={fileRef} type="file" accept=".csv,.txt" onChange={handleFile} className="hidden" />
         </div>
 
@@ -678,9 +946,89 @@ function TransactionsTab({ transactions, setTransactions, userId }) {
           </div>
         )}
 
-        {detectedBank && (
+        {pendingImport && (
+          <div className="mt-4 space-y-3">
+            <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
+              <p className="text-sm font-semibold text-gray-800 mb-3">
+                {pendingImport.mapped.length} transactions ready — confirm import details
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Bank</label>
+                  <select
+                    value={importMeta.bankName}
+                    onChange={e => setImportMeta(p => ({ ...p, bankName: e.target.value }))}
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                  >
+                    <option value="">Select bank…</option>
+                    {UK_BANKS.map(b => <option key={b} value={b}>{b}</option>)}
+                    <option value="other">Other…</option>
+                  </select>
+                  {importMeta.bankName === "other" && (
+                    <input
+                      className="mt-2 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                      placeholder="Enter bank name"
+                      value={importMeta.customBank}
+                      onChange={e => setImportMeta(p => ({ ...p, customBank: e.target.value }))}
+                    />
+                  )}
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Account Type</label>
+                  <div className="flex gap-2">
+                    {["debit","credit"].map(type => (
+                      <button
+                        key={type}
+                        onClick={() => setImportMeta(p => ({ ...p, accountType: type }))}
+                        className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium border transition-colors ${
+                          importMeta.accountType === type
+                            ? "bg-indigo-600 text-white border-indigo-600"
+                            : "bg-white text-gray-600 border-gray-300 hover:bg-gray-50"
+                        }`}
+                      >
+                        {type === "debit" ? "Debit Card" : "Credit Card"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {pendingImport.existing && (
+              <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-800">
+                <AlertCircle size={15} className="flex-shrink-0 mt-0.5 text-amber-600" />
+                <span>
+                  This file was already imported on{" "}
+                  <strong>{new Date(pendingImport.existing.uploaded_at).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}</strong>
+                  {" "}({pendingImport.existing.row_count} transactions). Confirming will replace them.
+                </span>
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              <button
+                onClick={handleConfirmImport}
+                disabled={saving || !importMeta.bankName || (importMeta.bankName === "other" && !importMeta.customBank.trim())}
+                className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 transition-colors disabled:opacity-40"
+              >
+                {saving ? "Importing…" : pendingImport.existing ? "Replace & Import" : "Confirm Import"}
+              </button>
+              <button
+                onClick={() => setPendingImport(null)}
+                disabled={saving}
+                className="px-4 py-2 bg-white border border-gray-300 text-gray-600 text-sm font-medium rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-40"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {importSuccess && !pendingImport && (
           <div className="mt-4 flex items-center gap-2 text-green-700 bg-green-50 p-3 rounded-lg text-sm">
-            <CheckCircle size={16} /> Detected format: <strong>{detectedBank}</strong> — imported {importCount} transactions
+            <CheckCircle size={16} />
+            Imported <strong>{importSuccess.count}</strong> transactions from <strong>{importSuccess.bankName}</strong>
+            {" "}(<span className="capitalize">{importSuccess.accountType}</span>)
           </div>
         )}
       </div>
@@ -1341,6 +1689,192 @@ function HMRCTab() {
   );
 }
 
+// === PROFILE TAB ===
+function ProfileTab({ userId, session, transactions, payslips }) {
+  const [profile, setProfile] = useState(null);
+  const [uploads, setUploads] = useState([]);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({ full_name: "", employer_name: "", is_married: false, has_children: false });
+  const [saving, setSaving] = useState(false);
+  const [success, setSuccess] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    Promise.all([loadProfile(userId), loadCSVUploads(userId)])
+      .then(([prof, ups]) => {
+        setProfile(prof);
+        setForm({
+          full_name: prof?.full_name || "",
+          employer_name: prof?.employer_name || "",
+          is_married: prof?.is_married || false,
+          has_children: prof?.has_children || false,
+        });
+        setUploads(ups);
+      })
+      .catch(err => setError(err.message));
+  }, [userId]);
+
+  const handleSave = async () => {
+    setSaving(true); setError(null); setSuccess(null);
+    try {
+      await updateProfile(userId, form);
+      setProfile(prev => ({ ...prev, ...form }));
+      setSuccess("Profile updated.");
+      setEditing(false);
+    } catch (err) {
+      setError(err.message);
+    }
+    setSaving(false);
+  };
+
+  const initials = (profile?.full_name || session?.user?.email || "?")
+    .split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
+
+  const dateRange = transactions.length > 0 ? (() => {
+    const dates = transactions.map(t => t.date).filter(Boolean).sort((a, b) => a - b);
+    return `${dates[0].toLocaleDateString("en-GB", { month: "short", year: "numeric" })} – ${dates[dates.length - 1].toLocaleDateString("en-GB", { month: "short", year: "numeric" })}`;
+  })() : null;
+
+  return (
+    <div className="space-y-6">
+      {/* Account overview */}
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+        <div className="flex items-center gap-4 mb-6">
+          <div className="w-14 h-14 rounded-full bg-indigo-600 flex items-center justify-center text-white text-lg font-bold flex-shrink-0">
+            {initials}
+          </div>
+          <div>
+            <p className="text-lg font-semibold text-gray-900">{profile?.full_name || "—"}</p>
+            <p className="text-sm text-gray-500">{session?.user?.email}</p>
+            {profile?.created_at && (
+              <p className="text-xs text-gray-400 mt-0.5">
+                Member since {new Date(profile.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {[
+            { label: "Transactions", value: transactions.length.toLocaleString() },
+            { label: "Payslips", value: payslips.length.toLocaleString() },
+            { label: "CSV Imports", value: uploads.length.toLocaleString() },
+            { label: "Date Range", value: dateRange || "—" },
+          ].map(s => (
+            <div key={s.label} className="bg-gray-50 rounded-lg p-3 text-center">
+              <p className="text-xs text-gray-500 mb-1">{s.label}</p>
+              <p className="text-sm font-semibold text-gray-900">{s.value}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Personal details */}
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold text-gray-900">Personal Details</h3>
+          {!editing
+            ? <button onClick={() => setEditing(true)} className="text-sm text-indigo-600 hover:text-indigo-800 font-medium">Edit</button>
+            : <div className="flex gap-2">
+                <button onClick={() => { setEditing(false); setSuccess(null); setError(null); }} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
+                <button onClick={handleSave} disabled={saving} className="text-sm bg-indigo-600 text-white px-3 py-1 rounded-lg hover:bg-indigo-700 disabled:opacity-50">{saving ? "Saving…" : "Save"}</button>
+              </div>
+          }
+        </div>
+
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Full Name</label>
+              {editing
+                ? <input value={form.full_name} onChange={e => setForm(p => ({ ...p, full_name: e.target.value }))} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+                : <p className="text-sm text-gray-900">{profile?.full_name || "—"}</p>
+              }
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Email</label>
+              <p className="text-sm text-gray-900">{session?.user?.email}</p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Employer</label>
+              {editing
+                ? <input value={form.employer_name} onChange={e => setForm(p => ({ ...p, employer_name: e.target.value }))} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" placeholder="e.g. Acme Ltd" />
+                : <p className="text-sm text-gray-900">{profile?.employer_name || "—"}</p>
+              }
+            </div>
+          </div>
+
+          <div className="flex gap-6">
+            {[
+              { key: "is_married", label: "Married / Civil Partnership" },
+              { key: "has_children", label: "Has Children" },
+            ].map(({ key, label }) => (
+              <label key={key} className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form[key]}
+                  onChange={e => setForm(p => ({ ...p, [key]: e.target.checked }))}
+                  disabled={!editing}
+                  className="w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 disabled:opacity-60"
+                />
+                <span className={`text-sm ${editing ? "text-gray-700" : "text-gray-500"}`}>{label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {error && <div className="mt-4 flex items-center gap-2 text-red-600 bg-red-50 p-3 rounded-lg text-sm"><AlertCircle size={14}/> {error}</div>}
+        {success && <div className="mt-4 flex items-center gap-2 text-green-700 bg-green-50 p-3 rounded-lg text-sm"><CheckCircle size={14}/> {success}</div>}
+      </div>
+
+      {/* Import history */}
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+        <h3 className="text-lg font-semibold text-gray-900 mb-4">Import History</h3>
+        {uploads.length === 0 ? (
+          <p className="text-sm text-gray-400 text-center py-6">No CSV files imported yet.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-200">
+                  <th className="text-left py-2 px-3 font-medium text-gray-500">File</th>
+                  <th className="text-left py-2 px-3 font-medium text-gray-500">Bank</th>
+                  <th className="text-left py-2 px-3 font-medium text-gray-500">Type</th>
+                  <th className="text-left py-2 px-3 font-medium text-gray-500">Imported</th>
+                  <th className="text-right py-2 px-3 font-medium text-gray-500">Transactions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {uploads.map(u => (
+                  <tr key={u.id} className="border-b border-gray-100 hover:bg-gray-50">
+                    <td className="py-2.5 px-3 text-gray-800 font-medium max-w-[200px] truncate">{u.file_name}</td>
+                    <td className="py-2.5 px-3 text-gray-700 whitespace-nowrap">{u.bank_name || <span className="text-gray-400 italic">Unknown</span>}</td>
+                    <td className="py-2.5 px-3">
+                      {u.account_type
+                        ? <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.account_type === "credit" ? "bg-purple-50 text-purple-700" : "bg-blue-50 text-blue-700"}`}>
+                            {u.account_type === "credit" ? "Credit" : "Debit"}
+                          </span>
+                        : <span className="text-gray-400 text-xs italic">—</span>
+                      }
+                    </td>
+                    <td className="py-2.5 px-3 text-gray-600 whitespace-nowrap">
+                      {new Date(u.uploaded_at).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}
+                      <span className="text-gray-400 text-xs ml-1">
+                        {new Date(u.uploaded_at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-right text-gray-700 font-medium">{(u.row_count || 0).toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─────────────────────────────────────────────
 // MAIN APP
 // ─────────────────────────────────────────────
@@ -1350,6 +1884,7 @@ const TABS = [
   { id: "payslips", label: "Payslips", icon: FileText },
   { id: "analysis", label: "Analysis", icon: TrendingUp },
   { id: "hmrc", label: "HMRC Schemes", icon: Landmark },
+  { id: "profile", label: "Profile", icon: User },
 ];
 
 // ─────────────────────────────────────────────
@@ -1480,6 +2015,20 @@ export default function App() {
   const [transactions, setTransactions] = useState([]);
   const [payslips, setPayslips] = useState([]);
   const [dataLoaded, setDataLoaded] = useState(false);
+  const [filterBank, setFilterBank] = useState("all");
+  const [filterAccountType, setFilterAccountType] = useState("all");
+
+  const uniqueBanks = useMemo(() =>
+    [...new Set(transactions.map(t => t.bank_name).filter(Boolean))].sort()
+  , [transactions]);
+
+  const filteredTransactions = useMemo(() =>
+    transactions.filter(t => {
+      if (filterBank !== "all" && t.bank_name !== filterBank) return false;
+      if (filterAccountType !== "all" && t.account_type !== filterAccountType) return false;
+      return true;
+    })
+  , [transactions, filterBank, filterAccountType]);
 
   // Listen for auth state changes
   useEffect(() => {
@@ -1599,12 +2148,67 @@ export default function App() {
         </div>
       </nav>
 
+      {/* Filter bar — shown on transactions & analysis tabs when data exists */}
+      {transactions.length > 0 && (activeTab === "transactions" || activeTab === "analysis") && (
+        <div className="bg-white border-b border-gray-100">
+          <div className="max-w-6xl mx-auto px-4 py-2 flex flex-wrap items-center gap-3">
+            <span className="text-xs font-medium text-gray-400 uppercase tracking-wide">Filter</span>
+
+            {/* Bank filter */}
+            <select
+              value={filterBank}
+              onChange={e => setFilterBank(e.target.value)}
+              className="text-sm border border-gray-200 rounded-lg px-2.5 py-1 text-gray-700 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+            >
+              <option value="all">All Banks</option>
+              {uniqueBanks.map(b => <option key={b} value={b}>{b}</option>)}
+              {transactions.some(t => !t.bank_name) && <option value="">Unknown</option>}
+            </select>
+
+            {/* Account type filter */}
+            <div className="flex rounded-lg border border-gray-200 overflow-hidden">
+              {[["all","All"],["debit","Debit"],["credit","Credit"]].map(([val, label]) => (
+                <button
+                  key={val}
+                  onClick={() => setFilterAccountType(val)}
+                  className={`px-3 py-1 text-xs font-medium transition-colors ${
+                    filterAccountType === val
+                      ? "bg-indigo-600 text-white"
+                      : "bg-white text-gray-600 hover:bg-gray-50"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {/* Active filter summary */}
+            {(filterBank !== "all" || filterAccountType !== "all") && (
+              <span className="text-xs text-indigo-600 font-medium">
+                {filteredTransactions.length.toLocaleString()} of {transactions.length.toLocaleString()} transactions
+              </span>
+            )}
+
+            {/* Reset */}
+            {(filterBank !== "all" || filterAccountType !== "all") && (
+              <button
+                onClick={() => { setFilterBank("all"); setFilterAccountType("all"); }}
+                className="text-xs text-gray-400 hover:text-gray-600 underline"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Content */}
       <main className="max-w-6xl mx-auto px-4 py-6">
-        {activeTab === "transactions" && <TransactionsTab transactions={transactions} setTransactions={setTransactions} userId={session.user.id} />}
+        {activeTab === "transactions" && <TransactionsTab transactions={filteredTransactions} setTransactions={setTransactions} userId={session.user.id} />}
         {activeTab === "payslips" && <PayslipTab payslips={payslips} setPayslips={setPayslips} transactions={transactions} userId={session.user.id} />}
-        {activeTab === "analysis" && <AnalysisTab transactions={transactions} payslips={payslips} />}
+        {activeTab === "analysis" && <AnalysisTab transactions={filteredTransactions} payslips={payslips} />}
         {activeTab === "hmrc" && <HMRCTab />}
+        {activeTab === "profile" && <ProfileTab userId={session.user.id} session={session} transactions={transactions} payslips={payslips} />}
       </main>
 
       {/* Footer */}
